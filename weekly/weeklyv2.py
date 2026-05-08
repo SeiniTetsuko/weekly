@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import builtins
+import sys
 import os
 import re
 import json
@@ -17,6 +18,25 @@ from openai import OpenAI
 from zenv import get_zdkit_env
 from zdbase import ZFile  # 保留平台兼容；本脚本主体不直接依赖
 
+
+
+# =============================================================================
+# 日志编码兜底：尽量避免中文日志在平台环境中出现 mojibake
+# =============================================================================
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+def safe_log_text(text):
+    text = str(text or "")
+    try:
+        text.encode("utf-8")
+        return text
+    except Exception:
+        return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
 
 # =============================================================================
 # print flush patch
@@ -239,8 +259,8 @@ def safe_json_loads(text):
 
 def get_json_file_content(category_guid):
     """
-    读取 treeList 中 type == 5 的 .json 文件。
-    type == 5 通常是文件节点，因此走 getSignedUrl 下载文件内容。
+    读取 treeList 中 dataType == 5 的 .json 文件。
+    dataType == 5 通常是文件节点，因此走 getSignedUrl 下载文件内容。
     """
     if not category_guid:
         raise ValueError("category_guid 不能为空")
@@ -495,7 +515,7 @@ def _get_tree_node_title(node):
 
 
 def _get_tree_node_guid(node):
-    for key in ("categoryGuid", "guid", "fileGuid", "dataGuid", "id"):
+    for key in ("categoryGuid", "dataGuid", "guid", "fileGuid", "id"):
         value = node.get(key)
         if value:
             return value
@@ -503,7 +523,7 @@ def _get_tree_node_guid(node):
 
 
 def _is_json_atomic_file_node(node):
-    node_type = node.get("type")
+    node_type = node.get("dataType", node.get("type"))
     try:
         is_file = int(node_type) == 5
     except Exception:
@@ -530,7 +550,7 @@ def _infer_date_from_title(title, date_list):
 def find_weekly_atomic_notes(user_guid, project_guid, folder_guid, date_list):
     """
     从目标文件夹中查找原子池 JSON 文件：
-    - type == 5
+    - dataType == 5
     - .json 后缀
     - 文件名命中上周 7 天日期时先记录日期；否则后续用 meta.date / items.date 判断
     """
@@ -559,7 +579,7 @@ def find_weekly_atomic_notes(user_guid, project_guid, folder_guid, date_list):
             "date": inferred_date,
             "categoryGuid": note_guid,
             "dataTitle": note_title,
-            "node_type": note.get("type")
+            "node_type": note.get("dataType", note.get("type"))
         })
 
     return matched_notes
@@ -567,7 +587,7 @@ def find_weekly_atomic_notes(user_guid, project_guid, folder_guid, date_list):
 
 def extract_text_from_note_json_node(node, parts):
     """
-    兼容历史：如果原子池写在文档正文而不是 type==5 文件，尽量抽取正文文本解析 JSON。
+    兼容历史：如果原子池写在文档正文而不是 dataType==5 文件，尽量抽取正文文本解析 JSON。
     """
     if isinstance(node, dict):
         node_type = node.get("type")
@@ -644,6 +664,7 @@ def load_weekly_atomic_pool(project):
 
     state_project_guid = (
         project.get("state_project_guid")
+        or project.get("state_target_project_guid")
         or project.get("weekly_atomic_pool_project_guid")
         or project.get("atomic_pool_project_guid")
         or project.get("project_guid")
@@ -651,6 +672,7 @@ def load_weekly_atomic_pool(project):
 
     state_parent_guid = (
         project.get("state_parent_guid")
+        or project.get("state_target_parent_guid")
         or project.get("weekly_atomic_pool_folder_guid")
         or project.get("atomic_pool_folder_guid")
         or project.get("work_log_folder_guid")
@@ -667,7 +689,7 @@ def load_weekly_atomic_pool(project):
     )
 
     print(f"[Step 1][{project_name}] 目标周期: {week_info['start_date']} ~ {week_info['end_date']}")
-    print(f"[Step 1][{project_name}] 固定搜索上周 7 天: {week_info['date_list']}")
+    print(f"[Step 1][{project_name}] 搜索上周 7 天: {week_info['date_list']}")
     print(f"[Step 1][{project_name}] 原子池空间 state_project_guid: {state_project_guid}")
     print(f"[Step 1][{project_name}] 原子池目录 state_parent_guid: {state_parent_guid}")
 
@@ -738,8 +760,15 @@ def load_weekly_atomic_pool(project):
                 continue
 
         json_note_url = meta.get("json_note_url") or f"{BASE_URL}/workspace/{note['note_guid']}"
-        markdown_note_url = meta.get("markdown_note_url") or json_note_url
-        source_urls[note_date] = markdown_note_url
+
+        # ✅ 源日报链接优先取原始日报 meta.source_url。
+        # 如果没有 source_url，再兼容旧字段 markdown_note_url；最后才兜底到原子池文件链接。
+        source_report_url = (
+            meta.get("source_url")
+            or meta.get("markdown_note_url")
+            or json_note_url
+        )
+        source_urls[note_date] = source_report_url
 
         for item in items:
             if not item.get("date"):
@@ -750,10 +779,10 @@ def load_weekly_atomic_pool(project):
 
         atomic_note_entries.append({
             "date": note_date,
-            "url": markdown_note_url,
+            "url": source_report_url,
             "json_url": json_note_url,
             "note_guid": note["note_guid"],
-            "note_title": note["note_title"],
+            "note_title": meta.get("note_title") or note["note_title"],
             "item_count": len(items)
         })
 
@@ -1020,57 +1049,92 @@ def get_default_trend_prompt():
 
 你会收到某一个 platform 下若干 project 的一周原子数据时间线。数据已经按 project / section / date 组织，并且 content_tree_markdown 中保留了原始日报的层级结构：
 - 浅层 bullet 通常是主题或主事项；
-- 深层 bullet 通常是该主题下的细节、子任务、验证方向、量化对象或依赖说明。
+- 深层 bullet 通常是该主题下的细节、子任务、验证方向、量化对象、困难、依赖或后续动作。
 
 你的任务不是简单逐条改写，而是理解一周内同一事项的推进趋势，并输出结构化 JSON，供后续拼接周报使用。
 
-# 必须输出合法 JSON，不要输出代码块，不要输出解释文字
+# 必须输出合法 JSON
+不要输出代码块，不要输出解释文字。
 
 # 输出结构
+必须严格输出以下结构：
+
 {
   "platform": "",
   "core_progress": [
     {
       "project_name": "",
-      "summary": "一句话总结本周最重要的阶段性进展，必须体现趋势或阶段变化",
-      "evidence_dates": ["YYYY-MM-DD"],
-      "source_item_ids": [""]
+      "subtopic": "",
+      "items": [
+        {
+          "mention": "[@姓名](mention:uid:id)",
+          "summary": "",
+          "evidence_dates": ["YYYY-MM-DD"],
+          "source_item_ids": [""]
+        }
+      ]
     }
   ],
   "main_progress": [
     {
       "project_name": "",
-      "summary": "项目本周主要进展，尽量覆盖输入中明确存在的重要进展，不要遗漏项目",
-      "evidence_dates": ["YYYY-MM-DD"],
-      "source_item_ids": [""]
+      "subtopic": "",
+      "items": [
+        {
+          "mention": "[@姓名](mention:uid:id)",
+          "summary": "",
+          "evidence_dates": ["YYYY-MM-DD"],
+          "source_item_ids": [""]
+        }
+      ]
     }
   ],
   "issues_support": [
     {
       "project_name": "",
-      "summary": "困难、风险、阻塞、依赖或所需支持；仅基于输入明确内容",
-      "evidence_dates": ["YYYY-MM-DD"],
-      "source_item_ids": [""]
+      "subtopic": "",
+      "items": [
+        {
+          "mention": "[@姓名](mention:uid:id)",
+          "summary": "",
+          "evidence_dates": ["YYYY-MM-DD"],
+          "source_item_ids": [""]
+        }
+      ]
     }
   ],
   "next_plan": [
     {
       "project_name": "",
-      "summary": "下一步计划或下周重点；仅基于输入明确内容",
-      "evidence_dates": ["YYYY-MM-DD"],
-      "source_item_ids": [""]
+      "subtopic": "",
+      "items": [
+        {
+          "mention": "[@姓名](mention:uid:id)",
+          "summary": "",
+          "evidence_dates": ["YYYY-MM-DD"],
+          "source_item_ids": [""]
+        }
+      ]
     }
   ]
 }
 
+# 字段来源要求
+1. platform 必须与输入 platform 完全一致。
+2. project_name 必须来自输入 projects[].project_name，不允许自行创造。
+3. subtopic 表示 project 下的模块、子项、专题或事项主题；只能来自 content_tree_markdown 中明确出现的模块名、子项名、专题名或事项标题。
+4. 如果无法识别明确 subtopic，则 subtopic 必须等于 project_name，不允许编造“项目X”“模块A”“相关工作”“其他事项”等名称。
+5. items[].mention 必须优先填写输入 item 中的 member 字段，例如 `[@姓名](mention:uid:id)`。
+6. 如果同一 subtopic 下有多位成员推进，必须分别作为多个 items[] 输出，不要合并后丢失 mention。
+7. 如果输入 member 为空，mention 可以为空字符串，但不得编造 mention。
+
 # 趋势理解规则
-1. 必须保留 platform 字段，值与输入一致。
-2. 每个 summary 要体现“周”的视角，例如：从A推进到B、完成A并进入B、围绕A持续验证、受B依赖影响待推进。
-3. 不要把 content_tree_markdown 中的子项当成独立主项目；它们应作为父事项的细节被综合进 summary。
-4. main_progress 要尽量覆盖每个 project 的主要进展；core_progress 只选本批次最重要的 2~6 条。
-5. issues_support 只写明确困难、依赖、风险、支持需求，不要自行推断。
-6. next_plan 只写明确计划，不要自行创造。
-7. 如果某数组无内容，输出空数组 []。
+1. 每个 summary 要体现“周”的视角，例如：从A推进到B、完成A并进入B、围绕A持续验证、受B依赖影响待推进。
+2. 不要把 content_tree_markdown 中的子项当成独立主项目；它们应作为父事项的细节被综合进 summary。
+3. main_progress 要尽量覆盖每个 project 的主要进展；core_progress 只选本批次最重要的 2~6 条。
+4. issues_support 只写明确困难、依赖、风险、支持需求，不要自行推断。
+5. next_plan 只写明确计划，不要自行创造。
+6. 如果某数组无内容，输出空数组 []。
 
 # 量化与枚举要求
 1. 如果输入中明确出现多个可枚举对象，例如算法、case、模块、平台、接口、实验、文档、任务项、缺陷类型等，必须尽量保留数量信息。
@@ -1084,7 +1148,6 @@ def get_default_trend_prompt():
 输入 JSON：
 {{batch_json}}
 """
-
 
 def get_default_final_weekly_prompt():
     return """# Role
@@ -1102,45 +1165,92 @@ def get_default_final_weekly_prompt():
 # 核心目标
 本任务的第一优先级不是语言优美，而是“主题覆盖完整”。
 
-输出结果必须尽可能保证：输入中每一个明确出现的项目、主题、事项，都能在最终周报中找到对应落点。
+输出结果必须尽可能保证：输入中每一个明确出现的 platform、project、subtopic、事项，都能在最终周报中找到对应落点。
+
+# 最高优先级原则
+1. 只允许基于输入内容进行整理、压缩、重组，不允许新增输入中不存在的事实。
+2. 严禁编造人名、账号、mention、项目状态、风险等级、延期时间、里程碑、测试结果、资源申请等信息。
+3. 严禁输出“日期范围、周数、源日报链接”等头部元信息，这些由系统自动补充。
+4. 若输入中已有 `[@姓名](mention:uid:id)`，请尽量原样保留；若输入中没有明确 mention，不要补充虚构人名。
+5. 不得将多个原本独立的主题粗暴合并成抽象上位类别，导致原主题名消失。
+6. 严禁输出“项目X”“模块A”“子项B”“相关工作”“其他工作”等占位或推测名称。
 
 # 输出结构
 必须严格输出以下 4 个章节，不要新增其他一级章节：
 
 ### 🎉 本周关键进展
 用一段 80~150 字的客观文字总结本周最核心的推进情况。
-不得输出日期范围、周数、源日报链接。
+
+要求：
+- 必须来自输入中已有的关键进展归纳，不允许额外创造事实。
+- 只做概括，不要求覆盖所有细项，但不得与下文详细内容冲突。
+- 不要写空泛评价。
+- 不要写“整体进展顺利”“符合预期”“状态良好”等输入中没有明确出现的判断。
 
 ### ✅ 本周主要进展
-必须按“主题 / 项目”分组输出，而不是按人分组。
-这一章节是完整覆盖章节，必须尽可能覆盖输入中所有明确存在的进展主题。
+必须按 platform → project → 事项 的层级输出。
 
-输出形式：
-- **主题A / platform**
-    - [@姓名](mention:uid:id) ...
-- **主题B / platform**
-    - ...
+标准格式：
+
+- **{Platform}**
+    - **{Project}**
+        - [@姓名](mention:uid:id) 具体进展事项
+        - [@姓名](mention:uid:id) 具体进展事项
+
+如果输入中明确存在模块/子项/专题名，可以增加一层 subtopic：
+
+- **{Platform}**
+    - **{Project}**
+        - **{Subtopic}**
+            - [@姓名](mention:uid:id) 具体进展事项
+
+字段来源要求：
+1. {Platform} 只能来自输入中已有的 platform 标题，不允许自行创造。
+2. {Project} 只能来自输入中已有的项目名，不允许自行创造。
+3. {Subtopic} 只能来自输入中明确出现的模块名、子项名、专题名或事项标题。
+4. 如果输入中没有明确 Subtopic，不要生成 Subtopic 层级。
+5. 每条具体事项如果输入中有 mention，必须尽量以原始 mention 开头。
+6. 不要按日期逐条流水账输出。
+7. 每条只保留一个明确事实，避免把多个无关动作塞进同一条。
+8. 即使某主题内容较少，只要输入中明确提到，也必须保留。
 
 ### ❗ 困难及所需帮助
-必须按“主题 / 项目”分组输出。
-仅列出输入中明确存在的风险、困难、阻塞项、依赖项、所需接口、所需资源、所需协助、跨团队支持。
-若无明确困难或帮助事项，输出：
+必须按 platform → project → 事项 的层级输出。
+
+标准格式：
+
+- **{Platform}**
+    - **{Project}**
+        - [@姓名](mention:uid:id) 具体困难或所需帮助
+
+如果无明确困难或帮助事项，输出：
 本周无明确阻塞性问题或外部协助事项。
 
+要求：
+1. 仅列出输入中明确存在的风险、困难、阻塞项、依赖项、所需接口、所需资源、所需协助、跨团队支持。
+2. 不要推断影响程度。
+3. 不要补充风险趋势。
+4. 不要编造未明确提出的资源需求。
+5. 若输入中有 mention，必须尽量保留原始 mention。
+
 ### 🙌 下一步计划
-必须按“主题 / 项目”分组输出。
-仅保留输入中明确存在的下一步推进方向、后续开发计划、后续验证计划、后续联调计划、后续优化方向。
-若无明确下一步计划，输出：
+必须按 platform → project → 事项 的层级输出。
+
+标准格式：
+
+- **{Platform}**
+    - **{Project}**
+        - [@姓名](mention:uid:id) 具体下一步计划
+
+如果无明确下一步计划，输出：
 本周无明确下一步计划。
 
-# 覆盖要求
-1. 不允许新增输入中不存在的事实。
-2. 不允许因为内容少而省略主题。
-3. 若某主题同时存在 progress / risk / help / next plan，应分别放入对应章节，不要混写。
-4. 若输入中存在 platform 信息，应体现在主题名中，例如：项目名 / G5。
-5. 若输入中已有 `[@姓名](mention:uid:id)`，请尽量原样保留。
-6. 不要输出 source_item_ids、evidence_dates、source_url 等中间态字段。
-7. 不要输出 JSON，不要输出代码块。
+要求：
+1. 仅保留输入中明确存在的下一步推进方向、后续开发计划、后续验证计划、后续联调计划、后续优化方向。
+2. 不要凭空推测未来规划。
+3. 不要将“困难”误写成“下一步计划”。
+4. 不要把“Need Help”直接改写成计划。
+5. 若输入中有 mention，必须尽量保留原始 mention。
 
 # 量化表达要求
 1. 最终周报必须尽量保留输入中的数量、枚举项和具体对象名称。
@@ -1154,34 +1264,51 @@ def get_default_final_weekly_prompt():
 7. 如果输入中只有模糊量词，没有具体名称或数字，不要自行编造数量。
 
 # 风格要求
-客观、中性、专业、简洁。不要空泛表述，不要主观评价。
+1. 客观、中性、专业、简洁。
+2. 不要空泛表述，不要主观评价。
+3. 不要输出规则本身。
+4. 输出必须是 Markdown 正文。
+5. 不要输出代码块。
+6. 不要输出 JSON。
+7. 不要输出日期范围、周数、源日报链接。
+8. 不要输出 source_item_ids、evidence_dates、source_url 等中间态字段。
 
 # 输入内容
 {{markdown_content}}
 """
 
-
 def get_default_coverage_check_prompt():
     return """你是周报覆盖性校验助手。
 
-你的任务是：对照“结构化汇总 Markdown 草稿”和“最终周报 Markdown”，检查最终周报是否遗漏了输入中明确出现的 platform / 项目 / 主题 / 事项。
+你的任务是：对照“结构化汇总 Markdown 草稿”和“最终周报 Markdown”，检查最终周报是否遗漏了输入中明确出现的 platform / project / subtopic / 事项。
 
 你只负责校验，不负责重新写周报。
 
 # 校验重点
-1. 结构化草稿中明确出现的项目/主题，在最终周报中是否有对应落点。
-2. 结构化草稿中明确出现的进展，是否进入最终周报的“本周主要进展”。
-3. 结构化草稿中明确出现的困难、阻塞、依赖、所需支持，是否进入最终周报的“困难及所需帮助”。
-4. 结构化草稿中明确出现的下一步计划，是否进入最终周报的“下一步计划”。
-5. mention 是否被明显丢失或错误替换。
-6. platform 维度是否被保留。
+1. 结构化草稿中明确出现的 platform，在最终周报中是否仍然存在。
+2. 结构化草稿中明确出现的 project，在最终周报中是否有对应落点。
+3. 结构化草稿中明确出现的 subtopic / 模块 / 子项，在最终周报中是否有对应落点；若最终周报没有 subtopic 层级，但事实完整保留，不算遗漏。
+4. 结构化草稿中明确出现的进展，是否进入最终周报的“本周主要进展”。
+5. 结构化草稿中明确出现的困难、阻塞、依赖、所需支持，是否进入最终周报的“困难及所需帮助”。
+6. 结构化草稿中明确出现的下一步计划，是否进入最终周报的“下一步计划”。
+7. mention 是否被明显丢失或错误替换。
+8. 明确数量或枚举项是否被压缩成“多个”“若干”“相关”等模糊表达。
 
-# 量化信息校验
-以下情况应判为遗漏或信息损失：
-1. 结构化草稿中明确列出了 A、B、C、D、E，但最终周报只写成“多个”。
-2. 结构化草稿中明确写了数量，例如“完成 8 个 case”，但最终周报删除了数量。
-3. 结构化草稿中有具体算法名、case 名、模块名，但最终周报压缩后不可识别。
-4. 结构化草稿中 1~5 个枚举对象被最终周报省略为模糊表达。
+# 不要误判
+以下情况不算遗漏：
+1. 最终周报换了等价表达，但 platform / project / 事实仍然可识别。
+2. 多条重复内容被合并，但没有丢失关键事实、mention 和数量。
+3. source_item_ids、evidence_dates、source_url 被删除，不算遗漏。
+4. subtopic 被省略，但相关事实仍完整保留在对应 project 下，不算遗漏。
+
+# 应判为遗漏或信息损失
+1. 草稿中存在某个 project，但最终周报完全没有出现。
+2. 草稿中存在明确困难或依赖，但最终周报未放入“困难及所需帮助”。
+3. 草稿中存在明确下一步计划，但最终周报未放入“下一步计划”。
+4. 草稿中存在 mention，最终周报保留了事实但删除了 mention。
+5. 草稿中明确列出了 A、B、C、D、E，但最终周报只写成“多个”。
+6. 草稿中明确写了数量，例如“完成 8 个 case”，但最终周报删除了数量。
+7. 最终周报出现了草稿中没有的项目名、模块名、人员或事实。
 
 # 输出要求
 必须只输出合法 JSON，不要输出代码块，不要输出解释文字。
@@ -1194,6 +1321,7 @@ def get_default_coverage_check_prompt():
       "section": "本周主要进展 / 困难及所需帮助 / 下一步计划 / 其他",
       "platform": "",
       "project_name": "",
+      "subtopic": "",
       "missing_fact": "",
       "suggested_insert_position": ""
     }
@@ -1207,8 +1335,12 @@ def get_default_coverage_check_prompt():
 }
 
 # 判断规则
-如果没有明显遗漏，pass=true，missing_items=[]。
-不要因为最终周报语言压缩就误判遗漏；只要事实有等价表达即可视为覆盖。
+如果没有明显遗漏，输出：
+{
+  "pass": true,
+  "missing_items": [],
+  "wrong_or_suspicious_items": []
+}
 
 # 结构化草稿
 {{structured_markdown}}
@@ -1216,7 +1348,6 @@ def get_default_coverage_check_prompt():
 # 最终周报
 {{final_markdown}}
 """
-
 
 def get_default_repair_prompt():
     return """你是周报修复助手。
@@ -1228,14 +1359,36 @@ def get_default_repair_prompt():
 
 你的任务是：在尽量保持当前最终周报结构和语言风格的前提下，把校验结果指出的遗漏项补回最终周报。
 
-# 要求
-1. 只补充结构化草稿中明确存在的事实，不允许新增事实。
-2. 不要输出日期范围、周数、源日报链接等头部信息。
-3. 不要输出解释文字，不要输出 JSON，只输出修复后的 Markdown 正文。
-4. 保留 mention 原样。
-5. 保留 platform / project / topic 可见。
-6. 不要为了压缩再次删除其他主题。
-7. 不要大规模重写整篇周报。
+# 最高优先级原则
+1. 只补充结构化草稿中明确存在的事实。
+2. 不允许新增结构化草稿中不存在的信息。
+3. 不允许编造人名、mention、项目名、模块名、状态、风险等级、延期时间、资源申请。
+4. 不要大规模重写整篇周报。
+5. 不要删除当前最终周报中已有的有效内容。
+6. 不要输出日期范围、周数、源日报链接等头部信息。
+7. 不要输出解释文字，不要输出 JSON，只输出修复后的 Markdown 正文。
+
+# 修复方式
+你只能进行以下操作：
+1. 在对应章节中插入遗漏 platform / project / 事实。
+2. 在已有 project 下补充遗漏事实。
+3. 补回被遗漏的 mention。
+4. 对明显放错章节的内容进行小范围移动。
+5. 在不改变事实的前提下做轻微语言衔接。
+
+# 层级要求
+请保持以下层级：
+- **{Platform}**
+    - **{Project}**
+        - [@姓名](mention:uid:id) 具体事项
+
+只有当结构化草稿中明确存在 Subtopic 时，才增加一层：
+- **{Platform}**
+    - **{Project}**
+        - **{Subtopic}**
+            - [@姓名](mention:uid:id) 具体事项
+
+严禁为了补齐格式而新增“项目X”“模块A”“相关工作”“其他事项”等推测层级。
 
 # 量化信息修复要求
 如果校验结果指出数量、枚举项或具体对象名称丢失，修复时必须补回：
@@ -1261,7 +1414,6 @@ def get_default_repair_prompt():
 {{validation_json}}
 """
 
-
 # =============================================================================
 # LLM：趋势分析 JSON
 # =============================================================================
@@ -1284,41 +1436,41 @@ def fallback_analyze_batch(batch_state):
 
     for project in batch_state.get("projects", []) or []:
         project_name = project.get("project_name", "未分类项目")
+
         for section_name, target_key in [
             ("progress", "main_progress"),
             ("issues_support", "issues_support"),
             ("next_plan", "next_plan"),
         ]:
-            summaries = []
-            dates = []
-            ids = []
-            for day in project.get("sections", {}).get(section_name, []) or []:
-                dates.append(day.get("date"))
-                for item in day.get("items", []) or []:
-                    ids.append(item.get("item_id", ""))
-                    text = "；".join([n.get("text", "") for n in item.get("content_tree", [])])
-                    if text:
-                        summaries.append(text)
+            grouped_items = []
 
-            if summaries:
-                summary = "；".join(summaries[:5])
-                if len(summary) > 500:
-                    summary = summary[:500] + "..."
+            for day in project.get("sections", {}).get(section_name, []) or []:
+                for item in day.get("items", []) or []:
+                    tree_md = "\n".join(tree_to_markdown(item.get("content_tree", [])))
+                    if not tree_md:
+                        continue
+
+                    grouped_items.append({
+                        "mention": item.get("member", {}).get("mention_md") or item.get("member", {}).get("label", ""),
+                        "summary": tree_md[:500],
+                        "evidence_dates": [day.get("date")] if day.get("date") else [],
+                        "source_item_ids": [item.get("item_id", "")]
+                    })
+
+            if grouped_items:
                 result[target_key].append({
                     "project_name": project_name,
-                    "summary": summary,
-                    "evidence_dates": sorted(set([d for d in dates if d])),
-                    "source_item_ids": [x for x in ids if x]
+                    "subtopic": project_name,
+                    "items": grouped_items[:10]
                 })
 
     result["core_progress"] = result["main_progress"][:3]
     return result
 
-
 def analyze_trend_batch(batch_idx, total_batches, batch_state, project):
     project_name = project.get("project_name", "Unknown")
     platform = batch_state.get("platform", "未标注平台")
-    print(f"    [Trend Batch {batch_idx}/{total_batches}][{project_name}][{platform}] 开始趋势分析，项目数: {len(batch_state.get('projects', []))}")
+    print(f"    [Trend Batch {batch_idx}/{total_batches}][{safe_log_text(project_name)}][{safe_log_text(platform)}] 开始趋势分析，项目数: {len(batch_state.get('projects', []))}")
 
     prompt_text = build_trend_prompt(batch_state, project)
     messages = [
@@ -1336,10 +1488,10 @@ def analyze_trend_batch(batch_idx, total_batches, batch_state, project):
         )
         parsed = safe_json_loads(llm_result)
         parsed.setdefault("platform", platform)
-        print(f"    [Trend Batch {batch_idx}/{total_batches}][{platform}] ✅ 趋势 JSON 解析完成")
+        print(f"    [Trend Batch {batch_idx}/{total_batches}][{safe_log_text(platform)}] ✅ 趋势 JSON 解析完成")
         return batch_idx, parsed
     except Exception as e:
-        print(f"    [Trend Batch {batch_idx}/{total_batches}][{platform}] ⚠️ 趋势分析失败，使用保底逻辑: {e}")
+        print(f"    [Trend Batch {batch_idx}/{total_batches}][{safe_log_text(platform)}] ⚠️ 趋势分析失败，使用保底逻辑: {e}")
         return batch_idx, fallback_analyze_batch(batch_state)
 
 
@@ -1377,11 +1529,41 @@ def analyze_trends_in_parallel(timeline_state, project, max_projects_per_batch=D
 # 趋势 JSON 合并与 Markdown 草稿生成
 # =============================================================================
 def normalize_analysis_item(item):
+    """
+    兼容两种 trend 输出：
+    1. 新结构：project_name + subtopic + items[]，可稳定保留 mention
+    2. 旧结构：project_name + summary，作为兜底兼容
+    """
+    project_name = (item.get("project_name") or "未分类项目").strip()
+    subtopic = (item.get("subtopic") or project_name).strip()
+
+    normalized_items = []
+
+    if isinstance(item.get("items"), list) and item.get("items"):
+        for child in item.get("items", []):
+            summary = (child.get("summary") or "").strip()
+            if not summary:
+                continue
+            normalized_items.append({
+                "mention": (child.get("mention") or "").strip(),
+                "summary": summary,
+                "evidence_dates": child.get("evidence_dates", []) or item.get("evidence_dates", []) or [],
+                "source_item_ids": child.get("source_item_ids", []) or item.get("source_item_ids", []) or [],
+            })
+    else:
+        summary = (item.get("summary") or "").strip()
+        if summary:
+            normalized_items.append({
+                "mention": (item.get("mention") or "").strip(),
+                "summary": summary,
+                "evidence_dates": item.get("evidence_dates", []) or [],
+                "source_item_ids": item.get("source_item_ids", []) or [],
+            })
+
     return {
-        "project_name": (item.get("project_name") or "未分类项目").strip(),
-        "summary": (item.get("summary") or "").strip(),
-        "evidence_dates": item.get("evidence_dates", []) or [],
-        "source_item_ids": item.get("source_item_ids", []) or [],
+        "project_name": project_name,
+        "subtopic": subtopic,
+        "items": normalized_items
     }
 
 
@@ -1397,7 +1579,7 @@ def merge_trend_results(batch_results):
         for key in section_keys:
             for item in result.get(key, []) or []:
                 normalized = normalize_analysis_item(item)
-                if normalized["summary"]:
+                if normalized.get("items"):
                     platform_map[platform][key].append(normalized)
 
     return platform_map
@@ -1406,16 +1588,35 @@ def merge_trend_results(batch_results):
 def dedupe_items(items):
     seen = set()
     deduped = []
+
     for item in items or []:
-        key = (item.get("project_name"), item.get("summary"))
-        if key in seen:
+        item_key = (
+            item.get("project_name"),
+            item.get("subtopic"),
+            tuple(
+                (x.get("mention", ""), x.get("summary", ""))
+                for x in item.get("items", [])
+            )
+        )
+        if item_key in seen:
             continue
-        seen.add(key)
+        seen.add(item_key)
         deduped.append(item)
     return deduped
 
 
 def render_platform_section(platform_map, section_key, empty_text="本周暂无明确内容。"):
+    """
+    输出层级：
+    - **{Platform}**
+        - **{Project}**
+            - [@Name](mention:uid:id) 完成了 XXX
+    如果 trend 阶段明确给出 subtopic，则输出：
+    - **{Platform}**
+        - **{Project}**
+            - **{Subtopic}**
+                - [@Name](mention:uid:id) 完成了 XXX
+    """
     parts = []
     any_content = False
 
@@ -1425,7 +1626,7 @@ def render_platform_section(platform_map, section_key, empty_text="本周暂无�
             continue
 
         any_content = True
-        parts.append(f"#### {platform}")
+        parts.append(f"- **{platform}**")
 
         grouped_by_project = OrderedDict()
         for item in items:
@@ -1434,11 +1635,38 @@ def render_platform_section(platform_map, section_key, empty_text="本周暂无�
             grouped_by_project[project_name].append(item)
 
         for project_name, project_items in grouped_by_project.items():
-            parts.append(f"- **{project_name}**")
+            parts.append(f"    - **{project_name}**")
+
+            grouped_by_subtopic = OrderedDict()
             for item in project_items:
-                dates = item.get("evidence_dates") or []
-                date_suffix = f"（{'、'.join(dates)}）" if dates else ""
-                parts.append(f"  * {item.get('summary', '')}{date_suffix}")
+                subtopic = item.get("subtopic") or project_name
+                grouped_by_subtopic.setdefault(subtopic, [])
+                grouped_by_subtopic[subtopic].extend(item.get("items", []))
+
+            for subtopic, action_items in grouped_by_subtopic.items():
+                # subtopic 和 project_name 一样时不重复显示一层，避免模型被迫生成假子项。
+                if subtopic and subtopic != project_name:
+                    parts.append(f"        - **{subtopic}**")
+                    leaf_indent = "            "
+                else:
+                    leaf_indent = "        "
+
+                seen_actions = set()
+                for action in action_items:
+                    mention = (action.get("mention") or "").strip()
+                    summary = (action.get("summary") or "").strip()
+                    if not summary:
+                        continue
+
+                    action_key = (mention, summary)
+                    if action_key in seen_actions:
+                        continue
+                    seen_actions.add(action_key)
+
+                    if mention:
+                        parts.append(f"{leaf_indent}- {mention} {summary}")
+                    else:
+                        parts.append(f"{leaf_indent}- {summary}")
 
         parts.append("")
 
@@ -1446,7 +1674,6 @@ def render_platform_section(platform_map, section_key, empty_text="本周暂无�
         return empty_text
 
     return "\n".join(parts).strip()
-
 
 def build_structured_body_markdown(platform_map):
     """
@@ -2196,13 +2423,12 @@ for project in projects:
 print("\n" + "=" * 60)
 print("全部周报任务执行完毕")
 print("=" * 60)
-'''
 
-path = Path("/mnt/data/weekly_atomic_report_full.py")
-path.write_text(code, encoding="utf-8")
+# path = Path("/mnt/data/weekly_atomic_report_full.py")
+# path.write_text(code, encoding="utf-8")
 
-# Compile check
-import py_compile
-py_compile.compile(str(path), doraise=True)
+# # Compile check
+# import py_compile
+# py_compile.compile(str(path), doraise=True)
 
-print(f"已生成并通过语法检查: {path}")
+# print(f"已生成并通过语法检查: {path}")
