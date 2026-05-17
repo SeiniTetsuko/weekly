@@ -1,0 +1,39 @@
+{
+  "ak": "",
+  "sk": "",
+  "org_guid": "",
+  "user_guid": "",
+  "llm_global": {
+    "base_url": "",
+    "api_key": "",
+    "model": "doubao-seed-2.0-pro",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "print_stream": false,
+    "max_retries": 5
+  },
+  "rollup_global": {
+    "rollup_trend_prompt_file_guid": "父部门趋势分析txt文件guid",
+    "rollup_final_prompt_file_guid": "父部门最终整理txt文件guid",
+    "rollup_validation_prompt_file_guid": "父部门覆盖校验txt文件guid",
+    "rollup_repair_prompt_file_guid": "父部门遗漏修复txt文件guid",
+    "rollup_projects_per_batch": 5,
+    "rollup_max_batch_chars": 12000,
+    "rollup_tree_max_chars": 2000,
+    "rollup_trend_temperature": 0.1,
+    "rollup_trend_max_tokens": 4096,
+    "rollup_final_temperature": 0.2,
+    "rollup_final_max_tokens": 4096,
+    "rollup_validation_temperature": 0.0,
+    "rollup_validation_max_tokens": 2048,
+    "rollup_repair_temperature": 0.1,
+    "rollup_repair_max_tokens": 4096,
+    "enable_rollup_coverage_check": true,
+    "enable_rollup_second_validation": false,
+    "batch_number": 10
+  },
+  "rollup_target_dept_ids": [
+    "CET"
+  ],
+  "dept_config_file_guid": "部门配置Excel文件guid"
+}
